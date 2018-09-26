@@ -32,13 +32,27 @@
 
 import json
 import ldap
+import logging
 import os
 import sys
 import six
 from six.moves import configparser
 
+
 ###################################################
 # DO NOT EDIT ABOVE THIS LINE.
+
+##
+# Logging
+##
+logger = logging.getLogger()
+handler = logging.StreamHandler()
+formatter = logging.Formatter(
+            '%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.ERROR)
+
 
 ##
 # Configuration settings
@@ -57,6 +71,7 @@ LDAP_BASEDN = "dc=lab,dc=example,dc=com"
 # See http://www.freeipa.org/page/HowTo/LDAP (may be outdated)
 LDAP_BINDDN = "uid=inventory,cn=users,cn=accounts,dc=lab,dc=example,dc=com"
 LDAP_BINDPW = "needabetterpassword"
+MEMBER_OF_GRP = ""
 
 # DO NOT EDIT BELOW THIS LINE.
 ###################################################
@@ -93,6 +108,7 @@ def get_config():
             'ldap_basedn': LDAP_BASEDN,
             'ldap_binddn': LDAP_BINDDN,
             'ldap_bindpw': LDAP_BINDPW,
+            'member_of_grp': MEMBER_OF_GRP,
             'ini_path': os.path.join(
                 os.path.dirname(__file__),
                 'ldap-freeipa.ini',
@@ -125,7 +141,7 @@ def get_config():
     return dict(config.items('ldap-freeipa'))
 
 
-def listgroup(ldap_uri, ldap_basedn, ldap_binddn, ldap_bindpw):
+def listgroup(ldap_uri, ldap_basedn, ldap_binddn, ldap_bindpw, member_of_grp):
 
     # Simple bind to the FreeIPA server and run a subtree
     # search for hostgroups (objectclass=ipahostgroup),
@@ -140,13 +156,35 @@ def listgroup(ldap_uri, ldap_basedn, ldap_binddn, ldap_bindpw):
         conn.protocol_version = ldap.VERSION3
         conn.simple_bind_s(ldap_binddn, ldap_bindpw)
     except ldap.INVALID_CREDENTIALS:
-        print("Your bind DN or password is incorrect.")
+        logger.error("Your bind DN or password is incorrect.")
         sys.exit(1)
     except ldap.LDAPError, e:
-        print("LDAPError: %s." % e)
+        logger.error("LDAPError: %s.", e)
         sys.exit(1)
 
     try:
+        member_of_grp_members = []
+        if member_of_grp:
+            # Only add hosts that are member of member_of_grp
+            # Get this hostgroup and members first.
+            member_of_grp_ldap_result = conn.search(
+                ldap_basedn,
+                search_scope,
+                "(&(objectclass=ipahostgroup)(cn=%s))" % member_of_grp,
+                search_attribute
+            )
+            while 1:
+                member_of_grp_result_type, member_of_grp_result_data = conn.result(
+                    member_of_grp_ldap_result, 0)
+                if (member_of_grp_result_data == []):
+                    break
+                if member_of_grp_result_type == ldap.RES_SEARCH_ENTRY:
+                    try:
+                        member_of_grp_members = member_of_grp_result_data[0][1]['member']
+                    except KeyError:
+                        member_of_grp_members = []
+
+        # Get all hostgroups and members.
         ldap_result = conn.search(
             ldap_basedn,
             search_scope,
@@ -178,25 +216,29 @@ def listgroup(ldap_uri, ldap_basedn, ldap_binddn, ldap_bindpw):
                         memberdn = ldap.dn.str2dn(member)
                         if (memberdn[0][0][0] == "cn"):
                             children.append(memberdn[0][0][1])
+                        if member_of_grp:
+                            if member not in member_of_grp_members:
+                                continue
                         if (memberdn[0][0][0] == "fqdn"):
                             hosts.append(memberdn[0][0][1])
 
-                    if (children != []):
-                        hostgroup[groupname] = {
-                            'hosts': hosts,
-                            'children': children
-                        }
-                    else:
-                        hostgroup[groupname] = {
-                            'hosts': hosts
-                        }
+                    if hosts:
+                        if (children != []):
+                            hostgroup[groupname] = {
+                                'hosts': hosts,
+                                'children': children
+                            }
+                        else:
+                            hostgroup[groupname] = {
+                                'hosts': hosts
+                            }
 
         # assume that we have no hostvars
         hostgroup["_meta"] = {'hostvars': {}}
         print(json.dumps(hostgroup))
 
     except ldap.LDAPError, e:
-        print("LDAPError: %s." % e)
+        logger.error("LDAPError: %s.", e)
     finally:
         conn.unbind_s()
 
@@ -215,6 +257,7 @@ if __name__ == '__main__':
             config['ldap_basedn'],
             config['ldap_binddn'],
             config['ldap_bindpw'],
+            config['member_of_grp'],
         )
     elif len(sys.argv) == 3 and (sys.argv[1] == '--host'):
         listhost(sys.argv[2])
